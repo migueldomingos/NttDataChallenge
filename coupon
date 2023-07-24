@@ -20,7 +20,7 @@ display(df)
 
 # Create a view or table
 
-temp_table_name = "coupon_v2_csv"
+temp_table_name = "coupon"
 
 df.createOrReplaceTempView(temp_table_name)
 
@@ -30,6 +30,6 @@ df.createOrReplaceTempView(temp_table_name)
 
 /* Query the created temp table in a SQL cell */
 
-select * from `coupon_v2_csv`
+select * from `coupon`
 
 ----------------------------------------------------
