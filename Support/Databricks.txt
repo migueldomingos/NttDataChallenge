@@ -1,0 +1,304 @@
+Extract data:
+
+CREATE TABLE table_identifier (col_name1 col_type1, ...)
+USING data_source
+OPTIONS (key1 = val1, key2 = val2, ...)
+LOCATION path
+
+Exemplo:
+CREATE TABLE IF NOT EXISTS events_json 
+  (key BINARY, offset LONG, partition INTEGER, timestamp LONG, topic STRING, value BINARY)
+USING JSON
+OPTIONS (
+  header = true
+)
+LOCATION "${DA.paths.kafka_events}"
+
+---------------------------------------------------------------------------------------------
+Inspect missing data:
+
+SELECT count_if(email IS NULL) FROM users_dirty;
+SELECT count(*) FROM users_dirty WHERE email IS NULL;
+
+OU
+
+%python 
+from pyspark.sql.functions import col
+usersDF = spark.read.table("users_dirty")
+
+usersDF.selectExpr("count_if(email IS NULL)")
+usersDF.where(col("email").isNull()).count()
+
+---------------------------------------------------------------------------------------------
+Deduplicate rows based on specific columns:
+
+The code below uses GROUP BY to remove duplicate records based on user_id and user_first_touch_timestamp column values.
+(Recall that these fields are both generated when a given user is first encountered, thus forming unique tuples.)
+
+Como fazemos GROUP BY naqueles 2 parâmetros, os duplicados nos outros parâmetros são "fundidos".
+
+Here, we are using the aggregate function max as a hack to:
+   - Keep values from the email and updated columns in the result of our group by
+   - Capture non-null emails when multiple records are present
+
+CREATE OR REPLACE TEMP VIEW deduped_users AS 
+SELECT user_id, user_first_touch_timestamp, max(email) AS email, max(updated) AS updated
+FROM users_dirty
+WHERE user_id IS NOT NULL
+GROUP BY user_id, user_first_touch_timestamp;
+
+SELECT * FROM deduped_users
+
+OU
+
+%python
+from pyspark.sql.functions import max
+dedupedDF = (usersDF
+    .where(col("user_id").isNotNull())
+    .groupBy("user_id", "user_first_touch_timestamp")
+    .agg(max("email").alias("email"), 
+         max("updated").alias("updated"))
+    )
+
+dedupedDF.count()
+
+---------------------------------------------------------------------------------------------
+
+Data overview:
+
+CREATE OR REPLACE TEMP VIEW events_strings AS 
+SELECT string(key), string(value) FROM events_raw;
+
+SELECT * FROM events_strings
+
+OU
+
+%python
+from pyspark.sql.functions import col
+
+events_stringsDF = (spark
+    .table("events_raw")
+    .select(col("key").cast("string"), 
+            col("value").cast("string"))
+    )
+display(events_stringsDF)
+
+---------------------------------------------------------------------------------------------
+
+Work with nested data:
+
+Use : syntax in queries to access subfields in JSON strings
+Use . syntax in queries to access subfields in struct types
+
+SELECT * FROM events_strings
+WHERE value:event_name = "finalize" 
+ORDER BY key 
+LIMIT 1
+
+OU
+
+%python
+display(events_stringsDF
+    .where("value:event_name = 'finalize'")
+    .orderBy("key")
+    .limit(1)
+)
+
+---------------------------------------------------------------------------------------------
+
+schema_of_json() and from_json():
+
+schema_of_json() returns the schema derived from an example JSON string.
+from_json() parses a column containing a JSON string into a struct type using the specified schema.
+
+After we unpack the JSON string to a struct type, let's unpack and flatten all struct fields into columns.
+	* unpacking can be used to flattens structs; col_name.* pulls out the subfields of col_name into their own columns.
+
+
+CREATE OR REPLACE TEMP VIEW parsed_events AS
+SELECT json.* FROM (
+  SELECT from_json(value, schema_of_json('{"device":"Linux",
+	"ecommerce":{"purchase_revenue_in_usd":1075.5,"total_item_quantity":1,"unique_items":1},
+	"event_name":"finalize",
+	"event_previous_timestamp":1593879231210816,
+	"event_timestamp":1593879335779563,
+	"geo":{"city":"Houston","state":"TX"},
+	"items":[{"coupon":"NEWBED10","item_id":"M_STAN_K","item_name":"Standard King Mattress","item_revenue_in_usd":1075.5,"price_in_usd":1195.0,"quantity":1}],
+	"traffic_source":"email","user_first_touch_timestamp":1593454417513109,"user_id":"UA000000106116176"}'
+  )) AS json 
+  FROM events_strings
+);
+
+SELECT * FROM parsed_events
+
+OU
+
+%python
+from pyspark.sql.functions import from_json, schema_of_json
+
+json_string = """
+{"device":"Linux",
+	"ecommerce":{"purchase_revenue_in_usd":1075.5,"total_item_quantity":1,"unique_items":1},
+	"event_name":"finalize",
+	"event_previous_timestamp":1593879231210816,
+	"event_timestamp":1593879335779563,
+	"geo":{"city":"Houston","state":"TX"},
+	"items":[{"coupon":"NEWBED10","item_id":"M_STAN_K","item_name":"Standard King Mattress","item_revenue_in_usd":1075.5,"price_in_usd":1195.0,"quantity":1}],
+	"traffic_source":"email","user_first_touch_timestamp":1593454417513109,"user_id":"UA000000106116176"}
+"""
+parsed_eventsDF = (events_stringsDF
+    .select(from_json("value", schema_of_json(json_string)).alias("json"))
+    .select("json.*")
+)
+
+display(parsed_eventsDF)
+
+---------------------------------------------------------------------------------------------
+
+Manipulate arrays:
+
+explode() separates the elements of an array into multiple rows; this creates a new row for each element.
+size() provides a count for the number of elements in an array for each row.
+
+CREATE OR REPLACE TEMP VIEW exploded_events AS
+SELECT *, explode(items) AS item
+FROM parsed_events;
+
+OU
+
+%python
+from pyspark.sql.functions import explode, size
+
+exploded_eventsDF = (parsed_eventsDF
+    .withColumn("item", explode("items"))
+)
+
+---------------------------------------------------------------------------------------------
+
+collect_set(), flatten() and array_distinct():
+
+collect_set() collects unique values for a field, including fields within arrays.
+flatten() combines multiple arrays into a single array.
+array_distinct() removes duplicate elements from an array.
+
+SELECT user_id,
+  collect_set(event_name) AS event_history,
+  array_distinct(flatten(collect_set(items.item_id))) AS cart_history
+FROM exploded_events
+GROUP BY user_id
+
+OU
+
+%python
+
+from pyspark.sql.functions import array_distinct, collect_set, flatten
+
+display(exploded_eventsDF
+    .groupby("user_id")
+    .agg(collect_set("event_name").alias("event_history"),
+            array_distinct(flatten(collect_set("items.item_id"))).alias("cart_history"))
+)
+
+---------------------------------------------------------------------------------------------
+
+Pivot tables:
+
+We can use PIVOT to view data from different perspectives by rotating unique values in a specified pivot column into multiple columns based on an aggregate function.
+
+The following code cell uses PIVOT to flatten out the item purchase information contained in several fields derived from the sales dataset. This flattened data format can be useful for dashboarding, but also useful for applying machine learning algorithms for inference or prediction.
+
+SELECT *
+FROM item_purchases
+PIVOT (
+  sum(item.quantity) FOR item_id IN (
+    'P_FOAM_K',
+    'M_STAN_Q',
+    'P_FOAM_S',
+    'M_PREM_Q',
+    'M_STAN_F',
+    'M_STAN_T',
+    'M_PREM_K',
+    'M_PREM_F',
+    'M_STAN_K',
+    'M_PREM_T',
+    'P_DOWN_S',
+    'P_DOWN_K')
+)
+
+---------------------------------------------------------------------------------------------
+
+SQL UDFs
+
+CREATE OR REPLACE FUNCTION sale_announcement(item_name STRING, item_price INT)
+RETURNS STRING
+RETURN concat("The ", item_name, " is on sale for $", round(item_price * 0.8, 0));
+
+SELECT *, sale_announcement(name, price) AS message FROM item_lookup
+
+
+CREATE OR REPLACE FUNCTION item_preference(name STRING, price INT)
+RETURNS STRING
+RETURN CASE 
+  WHEN name = "Standard Queen Mattress" THEN "This is my default mattress"
+  WHEN name = "Premium Queen Mattress" THEN "This is my favorite mattress"
+  WHEN price > 100 THEN concat("I'd wait until the ", name, " is on sale for $", round(price * 0.8, 0))
+  ELSE concat("I don't need a ", name)
+END;
+
+SELECT *, item_preference(name, price) FROM item_lookup
+
+---------------------------------------------------------------------------------------------
+
+Python UDFs
+
+from pyspark.sql.functions import col
+def first_letter_function(email):
+    return email[0]
+
+first_letter_function("annagray@kaufman.com")
+
+first_letter_udf = udf(first_letter_function)
+
+display(sales_df.select(first_letter_udf(col("email"))))
+
+sales_df.createOrReplaceTempView("sales")
+
+first_letter_udf = spark.udf.register("sql_udf", first_letter_function)
+
+---------------------------------------------------------------------------------------------
+
+Decorator Syntax (Python only)
+
+@udf("string")
+def first_letter_udf(email: str) -> str:
+    return email[0]
+
+---------------------------------------------------------------------------------------------
+
+Pandas/Vectorized UDFs
+
+import pandas as pd
+from pyspark.sql.functions import pandas_udf
+
+# We have a string input/output
+@pandas_udf("string")
+def vectorized_udf(email: pd.Series) -> pd.Series:
+    return email.str[0]
+
+# Alternatively
+# def vectorized_udf(email: pd.Series) -> pd.Series:
+#     return email.str[0]
+# vectorized_udf = pandas_udf(vectorized_udf, "string")
+
+spark.udf.register("sql_vectorized_udf", vectorized_udf)
+
+%sql
+-- Use the Pandas UDF from SQL
+SELECT sql_vectorized_udf(email) AS firstLetter FROM sales
+
+
+
+
+
+
+
